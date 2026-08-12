@@ -201,3 +201,4 @@
     "*.{js,cjs,mjs,ts,json,md,yml,yaml}": "prettier --write"
   }
 }  
+
