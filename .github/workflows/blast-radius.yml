@@ -1,0 +1,140 @@
+name: CI (blast-radius optimised)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # need parent SHA for the kill-switch diff
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26.x # matches axios's own CI (run-ci.yml)
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Playwright with deps
+        run: npx playwright install --with-deps
+
+      # -------------------------------------------------------------------
+      # Kill switch: if the diff touches config, lockfiles, CI, or test
+      # setup, we can't trust an incremental blast radius. Run everything.
+      # -------------------------------------------------------------------
+      - name: Detect kill-switch files
+        id: killswitch
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "no base SHA available (first push?) — assuming kill switch"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE_SHA" "${{ github.sha }}")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -Eq '^(package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|tsconfig[^/]*\.json|vitest\.config\.|babel\.config\.|\.babelrc|\.github/workflows/|.+\.setup\.[jt]sx?$)'; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------------------------------------------------------------------
+      # Ask Doraemon for the blast radius. On ANY failure, fall back to
+      # the full suite — Doraemon being down must never silently skip tests.
+      # -------------------------------------------------------------------
+      - name: Query Doraemon
+        id: doraemon
+        if: steps.killswitch.outputs.hit == 'false'
+        continue-on-error: true
+        run: |
+          set +e
+          RESPONSE=$(curl --fail --show-error --silent --max-time 60 \
+            -X POST "$DORAEMON_URL/ci/blast-radius" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -nc \
+                --arg repoUrl "${{ github.event.repository.clone_url }}" \
+                --arg sha     "${{ github.sha }}" \
+                --arg event   "${{ github.event_name }}" \
+                '{repoUrl: $repoUrl, sha: $sha, event: $event}')" )
+          CURL_EXIT=$?
+          set -e
+
+          if [ $CURL_EXIT -ne 0 ] || [ -z "$RESPONSE" ]; then
+            echo "reachable=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Doraemon unreachable (curl exit=$CURL_EXIT). Will fall back to full suite."
+            exit 0
+          fi
+
+          echo "$RESPONSE" | jq .
+          STATUS=$(echo "$RESPONSE"    | jq -r '.status')
+          AFFECTED=$(echo "$RESPONSE"  | jq -r '.affectedFiles | join("\n")')
+
+          echo "reachable=true" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS"   >> "$GITHUB_OUTPUT"
+          {
+            echo 'affected<<EOF'
+            echo "$AFFECTED"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+        env:
+          DORAEMON_URL: ${{ secrets.DORAEMON_URL }}
+
+      # -------------------------------------------------------------------
+      # Decide what to run. Mirrors axios's own CI split: unit + browser-headless.
+      # -------------------------------------------------------------------
+      - name: Run full suite (unit + browser-headless)
+        run: |
+          if [ "${{ steps.killswitch.outputs.hit }}" = "true" ]; then
+            echo "Kill-switch file changed → full suite"
+            npm run test:vitest:unit && npm run test:vitest:browser:headless
+            exit $?
+          fi
+
+          if [ "${{ steps.doraemon.outputs.reachable }}" != "true" ]; then
+            echo "Doraemon unreachable → full suite (fail-safe)"
+            npm run test:vitest:unit && npm run test:vitest:browser:headless
+            exit $?
+          fi
+
+          STATUS="${{ steps.doraemon.outputs.status }}"
+          if [ "$STATUS" = "initial-analysis" ]; then
+            echo "First analysis — running full suite once so future runs can diff against it"
+            npm run test:vitest:unit && npm run test:vitest:browser:headless
+            exit $?
+          fi
+
+          if [ "$STATUS" = "no-change" ]; then
+            echo "No changes since last analysis — skipping tests"
+            exit 0
+          fi
+
+          # STATUS == "success": map source files to their tests.
+          SOURCE_FILES=$(printf '%s\n' "${{ steps.doraemon.outputs.affected }}" \
+            | grep -vE '(^|/)(__tests__|__mocks__)/' \
+            | grep -vE '\.(test|spec)\.[jt]sx?$' \
+            || true)
+
+          if [ -z "$SOURCE_FILES" ]; then
+            echo "Only test files changed / no source impact — full suite skipped"
+            exit 0
+          fi
+
+          echo "Blast-radius source files:"
+          echo "$SOURCE_FILES"
+
+          # shellcheck disable=SC2086
+          npx vitest related --project unit $SOURCE_FILES \
+            && npx vitest related --project browser-headless $SOURCE_FILES
