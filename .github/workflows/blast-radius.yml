@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: # manual trigger for ROI baselining (no base SHA → kill switch → full suite)
 
 jobs:
   test:
@@ -24,7 +25,23 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      - name: Resolve Playwright version
+        id: pw-version
+        run: echo "version=$(node -p "require('playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # Browser binaries are ~400 MB and identical for a given Playwright
+      # version — caching them removes the dominant fixed cost of every job.
+      # System deps come from the ubuntu-latest image; if a run ever fails on
+      # a missing shared lib, bust the cache to force `--with-deps`.
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+
       - name: Install Playwright with deps
+        if: steps.pw-cache.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps
 
       # -------------------------------------------------------------------
