@@ -31,8 +31,6 @@ jobs:
 
       # Browser binaries are ~400 MB and identical for a given Playwright
       # version — caching them removes the dominant fixed cost of every job.
-      # System deps come from the ubuntu-latest image; if a run ever fails on
-      # a missing shared lib, bust the cache to force `--with-deps`.
       - name: Cache Playwright browsers
         id: pw-cache
         uses: actions/cache@v4
@@ -40,9 +38,14 @@ jobs:
           path: ~/.cache/ms-playwright
           key: ms-playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
 
-      - name: Install Playwright with deps
+      - name: Install Playwright browsers
         if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: npx playwright install --with-deps
+        run: npx playwright install
+
+      # Always run: runner images don't ship all browser libs (e.g. libevent
+      # for WebKit's MiniBrowser). Idempotent and cheap when satisfied.
+      - name: Install Playwright system deps
+        run: npx playwright install-deps
 
       # -------------------------------------------------------------------
       # Kill switch: if the diff touches config, lockfiles, CI, or test
